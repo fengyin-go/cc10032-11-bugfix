@@ -78,6 +78,17 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- CEP 命中告警统一走 `app/services/cep_ledger.py` 台账：一次命中只占用一个
+  已消费窗口，重复序列按「规则 + 事件序列」签名幂等，写入事务失败回滚原版本。
+  CEP规则、告警策略、故障恢复三个页面底部都有台账/核对面板：
+
+  | 接口 | 用途 |
+  | --- | --- |
+  | `GET /api/cep_rule/consumed-windows` | 已消费窗口（CEP 工作台） |
+  | `POST /api/cep_rule/{rule}/matches` | 读事件序列 → 匹配 → 写告警（幂等） |
+  | `GET /api/alert_policy/cep-merge` | 告警合并清单（唯一当前命中） |
+  | `POST /api/cep_rule/merge-alerts` | 合并重叠命中，`policy` 支持 `earliest_match` / `severity` |
+  | `GET /api/restore_plan/alert-sync` | 恢复方案引用告警的一致性核对 |
 
 领域：数据工程
 子方向：数据分析与数据应用

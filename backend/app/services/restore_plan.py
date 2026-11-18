@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from app.services import cep_ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -165,7 +166,6 @@ class RestorePlanService(BaseModuleService):
                 break
         if plan is None:
             return {"ok": False, "error": f"恢复方案「{plan_name}」不存在"}
-
         scope = plan.get("任务范围", "")
         checks = []
 
@@ -226,9 +226,68 @@ class RestorePlanService(BaseModuleService):
             })
         return result
 
+    def check_alert_sync(self, plan_id: int | None = None) -> dict[str, Any]:
+        """核对恢复方案引用的告警是否为合并清单保留的唯一当前命中。"""
+        if plan_id is not None:
+            plan = store.find(self.MODULE, plan_id)
+            if plan is None:
+                return {"ok": False, "error": f"恢复方案 {plan_id} 不存在"}
+            if plan.get("_alert_id") is None:
+                return {
+                    "ok": False,
+                    "plan_id": plan_id,
+                    "plan": plan.get("方案名称", ""),
+                    "error": "该方案未关联 CEP 命中告警",
+                    "checks": [],
+                }
+            report = cep_ledger.restore_alert_sync(plan)
+            return {
+                "ok": report["ok"],
+                "checked": 1,
+                "plans": [report],
+                "merge_list": report["merge_list"],
+            }
+
+        plans = [
+            plan for plan in store.rows(self.MODULE)
+            if plan.get("_alert_id") is not None
+        ]
+        reports = [cep_ledger.restore_alert_sync(plan) for plan in plans]
+        merge_list = cep_ledger.build_merge_list()
+        return {
+            "ok": all(report["ok"] for report in reports),
+            "checked": len(reports),
+            "plans": reports,
+            "merge_list": merge_list,
+        }
+
+    def list_linked_alerts(self) -> list[dict[str, Any]]:
+        """列出恢复方案引用的 CEP 命中告警，供详情页同步核对。"""
+        result = []
+        merge_list = cep_ledger.build_merge_list()
+        listed_ids = {entry["alert_id"] for entry in merge_list["entries"]}
+        for plan in store.rows(self.MODULE):
+            alert_id = plan.get("_alert_id")
+            if alert_id is None:
+                continue
+            alert = store.find("alert_policy", alert_id)
+            result.append({
+                "plan_id": plan.get("id"),
+                "plan": plan.get("方案名称", ""),
+                "restore_key": plan.get("_restore_key", ""),
+                "alert_id": alert_id,
+                "alert_signature": plan.get("_cep_signature", ""),
+                "alert_state": (alert or {}).get("_cep_state", "missing"),
+                "alert_level": (alert or {}).get("告警级别", ""),
+                "event_keys": list(plan.get("_alert_event_keys", [])),
+                "in_merge_list": alert_id in listed_ids,
+            })
+        return result
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)
         base["drilled"] = sum(1 for r in rows if r.get("status") == "已演练")
         base["activated"] = sum(1 for r in rows if r.get("status") == "已生效")
+        base["linked_alerts"] = sum(1 for r in rows if r.get("_alert_id") is not None)
         return base

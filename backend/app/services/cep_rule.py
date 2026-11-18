@@ -1,12 +1,18 @@
 """CEP规则领域服务：定义复杂事件处理的序列匹配规则。
 
 增强能力: 规则语法校验、模式匹配验证、跳过策略评估、匹配结果输出到告警策略
+
+匹配语义（序号11修复点）：
+  * 滑动窗口按事件顺序贪心匹配，一次命中占用一个已消费窗口；
+  * 窗口内事件整体消费，重叠事件不会再次进入同规则的下一次匹配；
+  * 命中写入告警策略时按「规则 + 事件序列」签名幂等，重复执行不追加记录；
+  * 写入走事务，失败时告警表回滚到原版本。
 """
 from __future__ import annotations
 
-import time
 from typing import Any
 
+from app.services import cep_ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -59,8 +65,9 @@ class CepRuleService(BaseModuleService):
 
     def match_and_alert(
         self, rule_name: str, events: list[dict[str, Any]],
+        alert_rule_name: str | None = None,
     ) -> dict[str, Any]:
-        """匹配CEP模式并写入告警策略。"""
+        """匹配CEP模式并把命中写入告警策略；同一序列重复执行保持幂等。"""
         rule = None
         for r in store.rows(self.MODULE):
             if r.get("序列名称") == rule_name:
@@ -74,52 +81,114 @@ class CepRuleService(BaseModuleService):
             for p in rule.get("匹配顺序", "").split(",")
             if p.strip()
         ]
+        event_types = [
+            e.strip()
+            for e in rule.get("事件类型", "").split(",")
+            if e.strip()
+        ]
         try:
             time_constraint = float(rule.get("时间约束", "60"))
         except (ValueError, TypeError):
             time_constraint = 60.0
 
-        events_sorted = sorted(events, key=lambda e: e.get("event_time", 0))
-        matches = []
-        for i in range(len(events_sorted) - len(pattern) + 1):
-            window = events_sorted[i:i + len(pattern)]
-            if window[-1].get("event_time", 0) - window[0].get("event_time", 0) > time_constraint:
-                continue
-            if all(
-                window[j].get("event_type", "") == pattern[j]
-                for j in range(len(pattern))
-            ):
-                matches.append(window)
+        identity = cep_ledger.rule_identity(rule_name)
+        # 已被本规则前序命中消费的事件不再参与匹配。
+        already_consumed = cep_ledger.consumed_keys(identity)
+        matches, skipped_consumed = cep_ledger.match_sequence(
+            events, pattern, time_constraint, identity,
+            consumed_keys=already_consumed,
+        )
 
-        if matches:
-            output_action = rule.get("动作输出", "alert")
-            alert_entry = {
-                "id": max(
-                    (int(r.get("id", 0)) for r in store.rows("alert_policy")), default=0
-                ) + 1,
-                "规则名称": f"cep_{rule_name}",
-                "监控指标": rule.get("事件类型", ""),
-                "触发条件": f"pattern_match_count={len(matches)}",
-                "告警级别": "WARNING",
-                "沉默窗口": "60s",
-                "通知方式": "push",
-                "升级路径": "oncall",
-                "status": "已启用",
-                "pending": True,
-                "abnormal": True,
-                "_cep_match_count": len(matches),
-                "_created_at": time.time(),
+        target_rule = alert_rule_name or f"cep_{rule_name}"
+        created = 0
+        reused = 0
+        skipped = 0
+        alert_ids: list[int] = []
+        try:
+            # 整批命中一次性提交：任一条写入失败则整体回滚到原版本。
+            with cep_ledger.transaction("alert_policy"):
+                for match in matches:
+                    outcome = cep_ledger.commit_hit(
+                        match,
+                        alert_rule_name=target_rule,
+                        level="WARNING",
+                        rule_row={
+                            "事件类型": rule.get("事件类型", ""),
+                            "沉默窗口": "60s",
+                            "通知方式": "push",
+                            "升级路径": "oncall",
+                        },
+                        origin="cep_rule.match_and_alert",
+                    )
+                    if outcome["created"]:
+                        created += 1
+                    elif outcome.get("skipped"):
+                        # 并发场景下另一请求已先消费了同一窗口。
+                        skipped += 1
+                        continue
+                    else:
+                        reused += 1
+                    alert_ids.append(outcome["alert_id"])
+        except Exception as exc:  # 事务已回滚，返回可重试的失败结果
+            return {
+                "ok": False,
+                "rule": rule_name,
+                "errors": [str(exc)],
+                "message": "CEP命中告警写入失败，告警表已回滚到原版本，可安全重试",
+                "matches": 0,
+                "created_alerts": 0,
+                "reused_alerts": 0,
+                "skipped_hits": 0,
+                "alert_ids": [],
             }
-            store.rows("alert_policy").append(alert_entry)
 
+        windows = len(matches) + skipped_consumed
         return {
             "ok": True,
             "rule": rule_name,
             "pattern": pattern,
+            "event_types": event_types,
             "total_events": len(events),
             "matches": len(matches),
-            "match_rate": len(matches) / max(len(events) - len(pattern) + 1, 1),
+            "created_alerts": created,
+            "reused_alerts": reused,
+            "skipped_hits": skipped,
+            "skipped_consumed_events": skipped_consumed,
+            "alert_ids": alert_ids,
+            # 候选窗口数：命中数 + 被已消费事件拦下的候选数
+            "match_rate": len(matches) / max(windows, 1),
+            "deduplicated": reused > 0 or skipped > 0,
+            "consumed_windows": cep_ledger.consumed_windows(identity),
         }
+
+    def list_consumed_windows(self, rule_name: str | None = None) -> dict[str, Any]:
+        """列出已消费窗口：工作台据此确认哪些事件序列已被命中占用。"""
+        if rule_name is not None:
+            known = any(
+                r.get("序列名称") == rule_name for r in store.rows(self.MODULE)
+            )
+            if not known:
+                return {"ok": False, "error": f"CEP规则「{rule_name}」不存在"}
+        snapshot = cep_ledger.consumed_windows(rule_name)
+        snapshot["ok"] = True
+        return snapshot
+
+    def list_cep_alerts(self, rule_name: str | None = None) -> dict[str, Any]:
+        """告警合并清单：只统计未被前序命中消费的事件对应的当前命中。"""
+        return {
+            "ok": True,
+            "merge_list": cep_ledger.build_merge_list(rule_name),
+            "retention_options": cep_ledger.describe_retention_options(),
+        }
+
+    def merge_cep_alerts(
+        self, rule_name: str | None = None, policy: str | None = None,
+    ) -> dict[str, Any]:
+        """合并同规则重叠命中，保留一个当前版本。"""
+        return cep_ledger.merge_hits(
+            rule_name=rule_name,
+            policy=policy or cep_ledger.DEFAULT_RETENTION,
+        )
 
     def evaluate_skip_strategy(
         self, rule_name: str, match_count: int,
@@ -151,4 +220,16 @@ class CepRuleService(BaseModuleService):
         rows = store.rows(self.MODULE)
         base["deployed"] = sum(1 for r in rows if r.get("status") == "已部署")
         base["running"] = sum(1 for r in rows if r.get("status") == "运行中")
+        hits = cep_ledger.cep_hits()
+        merge_list = cep_ledger.build_merge_list()
+        base["cep_hits"] = len(hits)
+        base["current_hits"] = sum(
+            1 for row in hits if row.get("_cep_state", "current") == "current"
+        )
+        base["merged_hits"] = sum(
+            1 for row in hits if row.get("_cep_state") == "merged"
+        )
+        base["consumed_events"] = merge_list["unique_event_count"]
+        base["merge_list_size"] = merge_list["total"]
+        base["duplicate_free"] = merge_list["duplicate_free"]
         return base

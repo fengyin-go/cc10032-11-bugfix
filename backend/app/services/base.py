@@ -15,6 +15,10 @@ class BaseModuleService:
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
 
+    def is_visible(self, row: dict[str, Any]) -> bool:
+        """列表可见性钩子：默认全部可见，模块可按版本状态隐藏历史记录。"""
+        return True
+
     def list_entries(
         self,
         *,
@@ -24,7 +28,7 @@ class BaseModuleService:
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
-        rows = list(store.rows(self.MODULE))
+        rows = [row for row in store.rows(self.MODULE) if self.is_visible(row)]
         for field, expected in (filters or {}).items():
             if field in self.LIST_FIELDS:
                 rows = [

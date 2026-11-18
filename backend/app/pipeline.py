@@ -361,30 +361,21 @@ def match_cep_pattern(
     events: list[dict[str, Any]],
     pattern: list[str],
     time_constraint_sec: float,
+    rule_name: str = "cep_pattern",
+    consumed_keys: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """在事件序列中匹配CEP模式。"""
-    matches: list[dict[str, Any]] = []
-    if not events or not pattern:
-        return matches
-    events_sorted = sorted(events, key=lambda e: e["event_time"])
-    pattern_len = len(pattern)
-    for i in range(len(events_sorted) - pattern_len + 1):
-        window = events_sorted[i:i + pattern_len]
-        # 检查时间约束
-        if window[-1]["event_time"] - window[0]["event_time"] > time_constraint_sec:
-            continue
-        # 检查模式匹配（事件类型顺序）
-        matched = all(
-            window[j].get("event_type", "") == pattern[j]
-            for j in range(pattern_len)
-        )
-        if matched:
-            matches.append({
-                "start_ts": window[0]["event_time"],
-                "end_ts": window[-1]["event_time"],
-                "events": window,
-                "pattern": pattern,
-            })
+    """在事件序列中匹配CEP模式。
+
+    滑动窗口按序贪心推进，一次命中占用一个已消费窗口：窗口内事件整体消费，
+    与下一窗口重叠的事件不会再次参与匹配。已被前序命中消费的事件通过
+    ``consumed_keys`` 传入时，含这些事件的候选窗口直接跳过。
+    """
+    from app.services import cep_ledger
+
+    matches, _ = cep_ledger.match_sequence(
+        events, pattern, time_constraint_sec, rule_name,
+        consumed_keys=consumed_keys,
+    )
     return matches
 
 
@@ -392,7 +383,13 @@ def trigger_alert_for_cep_matches(
     matches: list[dict[str, Any]],
     alert_rule_name: str,
 ) -> dict[str, Any]:
-    """根据CEP匹配结果触发告警。"""
+    """根据CEP匹配结果触发告警。
+
+    写入走统一的 CEP 命中台账：按「规则 + 事件序列」签名幂等，
+    同一序列重复触发只保留一条当前告警。
+    """
+    from app.services import cep_ledger
+
     if not matches:
         return {"triggered": False, "reason": "无匹配事件序列", "rule": alert_rule_name}
     # 查找告警策略
@@ -404,26 +401,112 @@ def trigger_alert_for_cep_matches(
     if alert_row is None:
         return {"triggered": False, "reason": f"未找到告警规则 {alert_rule_name}"}
     level = alert_row.get("告警级别", "WARNING")
-    alert_entry = {
-        "rule_name": alert_rule_name,
+
+    created = 0
+    reused = 0
+    alert_ids: list[int] = []
+    try:
+        with cep_ledger.transaction("alert_policy"):
+            for match in matches:
+                standardized = _standardize_match(match, alert_rule_name)
+                outcome = cep_ledger.commit_hit(
+                    standardized,
+                    alert_rule_name=alert_rule_name,
+                    level=level,
+                    rule_row=alert_row,
+                    origin="pipeline.trigger_alert_for_cep_matches",
+                )
+                if outcome["created"]:
+                    created += 1
+                elif outcome.get("skipped"):
+                    continue
+                else:
+                    reused += 1
+                alert_ids.append(outcome["alert_id"])
+    except Exception as exc:
+        return {
+            "triggered": False,
+            "error": str(exc),
+            "reason": "CEP命中告警写入失败，告警表已回滚到原版本",
+            "rule": alert_rule_name,
+            "matches": len(matches),
+            "created_alerts": 0,
+            "reused_alerts": 0,
+            "alert_ids": [],
+        }
+
+    first_ts = matches[0].get("start_ts", 0)
+    last_ts = matches[-1].get("end_ts", 0)
+    return {
+        "triggered": created > 0,
         "level": level,
+        "matches": len(matches),
+        "created_alerts": created,
+        "reused_alerts": reused,
+        "alert_ids": alert_ids,
+        "deduplicated": reused > 0,
+        "rule": alert_rule_name,
         "match_count": len(matches),
-        "first_match_ts": matches[0]["start_ts"] if matches else 0,
-        "last_match_ts": matches[-1]["end_ts"] if matches else 0,
-        "timestamp": time.time(),
-        "status": "已启用",
+        "first_match_ts": first_ts,
+        "last_match_ts": last_ts,
     }
-    store.rows("alert_policy").append(alert_entry)
-    return {"triggered": True, "level": level, "matches": len(matches), "rule": alert_rule_name}
+
+
+def _standardize_match(match: dict[str, Any], alert_rule_name: str) -> dict[str, Any]:
+    """把管道匹配对象统一成台账要求的形状（缺签名时补一个）。"""
+    from app.services import cep_ledger
+
+    if match.get("signature") and match.get("event_keys"):
+        return match
+    window = list(match.get("events", []))
+    pattern = list(match.get("pattern", []))
+    identity = cep_ledger.rule_identity(
+        match.get("rule") or alert_rule_name
+    )
+    standardized = cep_ledger.make_match(
+        identity, pattern, window, match.get("sequence_index", 0),
+    )
+    standardized["start_ts"] = match.get("start_ts", standardized["start_ts"])
+    standardized["end_ts"] = match.get("end_ts", standardized["end_ts"])
+    return standardized
 
 
 def generate_restore_plan(
     trigger_count: int,
     task_scope: str,
+    rule_name: str | None = None,
 ) -> dict[str, Any]:
-    """根据告警触发次数生成故障恢复方案。"""
+    """根据告警触发次数生成故障恢复方案。
+
+    若 ``rule_name`` 对应的 CEP 命中已有合并清单，方案只引用保留的那条
+    当前命中；同一恢复键重复生成时复用已有方案，保证刷新/重跑幂等。
+    """
+    from app.services import cep_ledger
+
     if trigger_count == 0:
         return {"plan_created": False, "reason": "无告警触发，无需恢复方案"}
+
+    kept_alert = None
+    if rule_name:
+        merge_list = cep_ledger.build_merge_list(rule_name)
+        if merge_list["entries"]:
+            kept_id = min(
+                entry["alert_id"] for entry in merge_list["entries"]
+            )
+            kept_alert = store.find("alert_policy", kept_id)
+
+    restore_key = (
+        f"cep:{rule_name}:{kept_alert.get('_cep_signature', '')}"
+        if kept_alert else f"scope:{task_scope}:{int(time.time() * 1000)}"
+    )
+    # 同一 CEP 命中只对应一个恢复方案；没有关联命中时保持原有逐次生成语义。
+    if kept_alert is not None:
+        for existing in store.rows("restore_plan"):
+            if existing.get("_restore_key") == restore_key:
+                existing["plan_created"] = False
+                existing["_idempotent_reuse"] = True
+                return existing
+
     plan = {
         "id": max(
             (int(r.get("id", 0)) for r in store.rows("restore_plan")), default=0
@@ -439,7 +522,14 @@ def generate_restore_plan(
         "pending": True,
         "abnormal": False,
         "_trigger_count": trigger_count,
+        "_restore_key": restore_key,
     }
+    if kept_alert is not None:
+        plan["_alert_id"] = kept_alert.get("id")
+        plan["_cep_rule"] = kept_alert.get("_cep_rule", "")
+        plan["_cep_signature"] = kept_alert.get("_cep_signature", "")
+        plan["_alert_event_keys"] = list(kept_alert.get("_cep_event_keys", []))
+        kept_alert["_restore_plan_id"] = plan["id"]
     store.rows("restore_plan").append(plan)
     plan["plan_created"] = True
     return plan
@@ -673,9 +763,13 @@ def run_end_to_end_pipeline(
         {"event_id": f"ev_{i}", "event_type": t, "event_time": time.time() + i}
         for i, t in enumerate(["login_fail", "login_fail", "login_fail", "access_granted"])
     ]
-    cep_matches = match_cep_pattern(cep_events, ["login_fail"] * 3, 60.0)
+    cep_matches = match_cep_pattern(
+        cep_events, ["login_fail"] * 3, 60.0, rule_name="login_fail",
+    )
     alert_result = trigger_alert_for_cep_matches(cep_matches, "告警策略样例1")
-    restore_result = generate_restore_plan(len(cep_matches), "login_security")
+    restore_result = generate_restore_plan(
+        len(cep_matches), "login_security", rule_name="login_fail",
+    )
     report["chain4_cep_restore"] = {
         "cep_matches": len(cep_matches),
         "alert": alert_result,
